@@ -1,6 +1,6 @@
 {
-    "description": "Generating content understanding from video.",
-    "scenario": "videoShot",
+    "baseAnalyzerId": "prebuilt-videoAnalyzer",
+    "description": "Generating content understanding from video with selling point extraction.",
     "config": {
         "returnDetails": true,
         "locales": [
@@ -15,16 +15,9 @@
             "pt-BR",
             "zh-CN"
         ],
-        "enableFace": false
-    },
-    "fieldSchema": {
-        "name": "Content Understanding",
-        "descriptions": "Generate content understanding from video.",
-        "fields": {
-            "sellingPoint": {
-                "type": "string",
-                "description": "Selling point of the product."
-            }
-        }
+        "enableFace": false,
+        "segmentationMode": "auto",
+        "disableFaceBlurring": false,
+        "disableContentFiltering": false
     }
 }

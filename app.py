@@ -51,8 +51,28 @@ from transcribe_videos import (
 )
 from content_understanding_client import AzureContentUnderstandingClient
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+def setup_logging(log_level='DEBUG'):
+    """Setup logging configuration"""
+    level = getattr(logging, log_level.upper(), logging.DEBUG)
+    logging.basicConfig(level=level, format='%(asctime)s %(levelname)s [%(name)s]: %(message)s')
+
+    # Enable debug logging for HTTP requests only if DEBUG level
+    if level == logging.DEBUG:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        logging.getLogger("urllib3").setLevel(logging.DEBUG)
+        logging.getLogger("requests").setLevel(logging.DEBUG)
+        logging.getLogger("azure").setLevel(logging.DEBUG)
+        logging.getLogger("openai").setLevel(logging.DEBUG)
+    else:
+        # Set higher levels for noisy loggers
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("requests").setLevel(logging.WARNING)
+        logging.getLogger("azure").setLevel(logging.INFO)
+        logging.getLogger("openai").setLevel(logging.INFO)
+
+# Initial setup with INFO level (will be reconfigured based on args)
+setup_logging('INFO')
 
 # Load environment variables
 load_dotenv(override=True)
@@ -277,7 +297,14 @@ New selling points may be mentioned in the transcript that are not included in t
         return selling_points
     
     except Exception as e:
-        logging.error(f"Error extracting selling points: {e}")
+        import traceback
+        error_details = traceback.format_exc()
+        logging.error("Error extracting selling points: %s", str(e), extra={
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "transcription_length": len(transcription_text) if transcription_text else 0
+        })
+        logging.debug("Full error traceback for selling points extraction:\n%s", error_details)
         return []
 
 def match_selling_points_with_timestamps(word_segments, selling_points):
@@ -439,7 +466,11 @@ def merge_segments_by_selling_points(content_json, selling_points_json, time_dev
     }
     
     # Get video segments from content understanding output
-    video_segments = content_json["result"]["contents"]
+    # The prebuilt-videoAnalyzer format has segments nested in contents[0].segments
+    if "contents" in content_json["result"] and content_json["result"]["contents"]:
+        video_segments = content_json["result"]["contents"][0].get("segments", [])
+    else:
+        video_segments = []
     
     # Track which segments have been merged
     merged_segment_indices = set()
@@ -488,8 +519,8 @@ def merge_segments_by_selling_points(content_json, selling_points_json, time_dev
                     overlapping_segments.append({
                         "startTimeMs": segment["startTimeMs"],
                         "endTimeMs": segment["endTimeMs"],
-                        "sellingPoint": segment["fields"].get("sellingPoint", {}).get("valueString", ""),
-                        "description": segment["fields"].get("description", {}).get("valueString", "")
+                        "sellingPoint": "",  # prebuilt-videoAnalyzer doesn't have sellingPoint field
+                        "description": segment.get("description", "")
                     })
                     # Mark this segment as merged
                     merged_segment_indices.add(i)
@@ -512,8 +543,8 @@ def merge_segments_by_selling_points(content_json, selling_points_json, time_dev
             result["unmerged_segments"].append({
                 "startTimeMs": segment["startTimeMs"],
                 "endTimeMs": segment["endTimeMs"],
-                "sellingPoint": segment["fields"].get("sellingPoint", {}).get("valueString", ""),
-                "description": segment["fields"].get("description", {}).get("valueString", "")
+                "sellingPoint": "",  # prebuilt-videoAnalyzer doesn't have sellingPoint field
+                "description": segment.get("description", "")
             })
     
     # Create final segments from merged segments with overlapping segments
@@ -544,6 +575,25 @@ def merge_segments_by_selling_points(content_json, selling_points_json, time_dev
         result["final_segments"].append(final_segment)
     
     return result
+
+def list_available_analyzers(endpoint: str, api_version: str, api_key: str) -> list:
+    """
+    List all available analyzers to find valid baseAnalyzerId values
+    """
+    try:
+        cu_client = AzureContentUnderstandingClient(
+            endpoint=endpoint,
+            api_version=api_version,
+            api_key=api_key,
+            x_ms_useragent="azure-ai-content-understanding-python/video_analysis",
+        )
+        
+        analyzers = cu_client.get_all_analyzers()
+        logging.debug("Available analyzers: %s", json.dumps(analyzers, indent=2))
+        return analyzers
+    except Exception as e:
+        logging.error("Failed to list analyzers: %s", str(e))
+        return []
 
 def analyze_video(video_path: str, 
                  endpoint: str, 
@@ -610,7 +660,15 @@ def analyze_video(video_path: str,
         
         return output_json
     except Exception as e:
-        logging.error("Video analysis failed: %s", str(e), extra={"error": str(e)})
+        import traceback
+        error_details = traceback.format_exc()
+        logging.error("Video analysis failed for %s", video_path, extra={
+            "video": video_path,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": error_details
+        })
+        logging.debug("Full error traceback:\n%s", error_details)
         return None
 
 async def update_status(video_name: str, status: str, progress: int, message: str = ""):
@@ -1100,6 +1158,8 @@ def parse_arguments():
     parser.add_argument('--batch', action='store_true', help='Run in batch mode without web UI')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the web server to')
     parser.add_argument('--port', type=int, default=8000, help='Port to bind the web server to')
+    parser.add_argument('--log-level', type=str, default='DEBUG', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                       help='Set the logging level (default: DEBUG)')
     return parser.parse_args()
 
 async def process_all_videos_batch():
@@ -1112,6 +1172,21 @@ async def process_all_videos_batch():
         return
     
     logging.info(f"Found {len(videos)} videos to process")
+    
+    # First, list available analyzers to help debug baseAnalyzerId issues
+    if CONTENT_UNDERSTANDING_API_KEY:
+        logging.info("Listing available analyzers...")
+        loop = asyncio.get_event_loop()
+        available_analyzers = await loop.run_in_executor(
+            executor,
+            list_available_analyzers,
+            CONTENT_UNDERSTANDING_ENDPOINT,
+            CONTENT_UNDERSTANDING_API_VERSION,
+            CONTENT_UNDERSTANDING_API_KEY
+        )
+        if available_analyzers:
+            analyzer_names = [analyzer.get('name', analyzer.get('id', 'Unknown')) for analyzer in available_analyzers.get('value', [])]
+            logging.info("Available base analyzers: %s", analyzer_names)
     
     # Process videos concurrently with a limit
     semaphore = asyncio.Semaphore(3)  # Limit concurrent processing
@@ -1320,7 +1395,12 @@ async def get_results(video_name: str):
     
     # Process content understanding segments for easier display
     if "content_understanding" in results and "result" in results["content_understanding"]:
-        raw_segments = results["content_understanding"]["result"].get("contents", [])
+        # Handle prebuilt-videoAnalyzer format: contents[0].segments[]
+        content_result = results["content_understanding"]["result"]
+        if "contents" in content_result and content_result["contents"]:
+            raw_segments = content_result["contents"][0].get("segments", [])
+        else:
+            raw_segments = []
         processed_segments = []
         
         for idx, segment in enumerate(raw_segments):
@@ -1329,9 +1409,10 @@ async def get_results(video_name: str):
                 "startTimeMs": segment.get("startTimeMs", 0),
                 "endTimeMs": segment.get("endTimeMs", 0),
                 "duration": (segment.get("endTimeMs", 0) - segment.get("startTimeMs", 0)) / 1000.0,
-                "sellingPoint": segment.get("fields", {}).get("sellingPoint", {}).get("valueString", ""),
-                "description": segment.get("fields", {}).get("description", {}).get("valueString", ""),
-                "confidence": segment.get("fields", {}).get("sellingPoint", {}).get("confidence", 0)
+                "sellingPoint": "",  # prebuilt-videoAnalyzer doesn't have sellingPoint field
+                "description": segment.get("description", ""),
+                "confidence": 0,  # prebuilt-videoAnalyzer doesn't provide confidence scores
+                "segmentId": segment.get("segmentId", str(idx + 1))
             }
             
             # Add merge status if merged_segments exists
@@ -1499,9 +1580,26 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 if __name__ == "__main__":
     args = parse_arguments()
     
+    # Configure logging based on command line argument
+    setup_logging(args.log_level)
+    
+    # Debug proxy and network configuration
+    if args.log_level == 'DEBUG':
+        logging.debug("HTTP_PROXY: %s", os.environ.get('HTTP_PROXY', 'Not set'))
+        logging.debug("HTTPS_PROXY: %s", os.environ.get('HTTPS_PROXY', 'Not set'))
+        logging.debug("NO_PROXY: %s", os.environ.get('NO_PROXY', 'Not set'))
+        logging.debug("Environment variables loaded:")
+        for key, value in [
+            ('AZURE_SPEECH_KEY', SPEECH_KEY),
+            ('AZURE_SPEECH_ENDPOINT', SPEECH_ENDPOINT),
+            ('AZURE_OPENAI_ENDPOINT', OPENAI_ENDPOINT),
+            ('AZURE_CONTENT_UNDERSTANDING_ENDPOINT', CONTENT_UNDERSTANDING_ENDPOINT),
+        ]:
+            logging.debug("%s: %s", key, 'SET' if value else 'NOT SET')
+    
     if args.batch:
         # Run in batch mode without web UI
-        logging.info("Starting batch processing mode...")
+        logging.info("Starting batch processing mode with log level: %s", args.log_level)
         
         # Run the async batch processing
         asyncio.run(process_all_videos_batch())
@@ -1511,5 +1609,5 @@ if __name__ == "__main__":
     else:
         # Start the web UI server
         import uvicorn
-        logging.info("Starting web UI server on %s:%d", args.host, args.port)
+        logging.info("Starting web UI server on %s:%d with log level: %s", args.host, args.port, args.log_level)
         uvicorn.run(app, host=args.host, port=args.port)

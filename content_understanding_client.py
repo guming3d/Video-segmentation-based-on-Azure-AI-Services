@@ -5,6 +5,10 @@ import json
 import time
 from pathlib import Path
 
+# Enable debug logging for requests
+logging.getLogger("requests.packages.urllib3").setLevel(logging.DEBUG)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.DEBUG)
+
 
 class AzureContentUnderstandingClient:
     def __init__(
@@ -155,14 +159,29 @@ class AzureContentUnderstandingClient:
         headers = {"Content-Type": "application/json"}
         headers.update(self._headers)
 
-        response = requests.put(
-            url=self._get_analyzer_url(self._endpoint, self._api_version, analyzer_id),
-            headers=headers,
-            json=analyzer_template,
-        )
-        response.raise_for_status()
-        self._logger.info(f"Analyzer {analyzer_id} create request accepted.")
-        return response
+        url = self._get_analyzer_url(self._endpoint, self._api_version, analyzer_id)
+        self._logger.debug("Creating analyzer at URL: %s", url)
+        self._logger.debug("Request headers: %s", {k: v for k, v in headers.items() if 'key' not in k.lower()})
+        
+        try:
+            response = requests.put(
+                url=url,
+                headers=headers,
+                json=analyzer_template,
+                timeout=30
+            )
+            self._logger.debug("Response status: %s", response.status_code)
+            self._logger.debug("Response headers: %s", dict(response.headers))
+            response.raise_for_status()
+            self._logger.info("Analyzer %s create request accepted.", analyzer_id)
+            return response
+        except requests.exceptions.RequestException as e:
+            self._logger.error("Failed to create analyzer %s: %s", analyzer_id, str(e))
+            self._logger.error(e)
+            if hasattr(e, 'response') and e.response is not None:
+                self._logger.error("Response status: %s", e.response.status_code)
+                self._logger.error("Response text: %s", e.response.text)
+            raise
 
     def delete_analyzer(self, analyzer_id: str):
         """
